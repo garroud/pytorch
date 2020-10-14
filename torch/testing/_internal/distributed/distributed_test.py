@@ -67,6 +67,13 @@ collectives_object_test_list = [
     [1, 2, True, "string", [4, 5, "nested"]],
 ]
 
+# Dummy NamedTuple data structures to test DDP support for NamedTuple types.
+EXPECTED_FIELDS = ("a", "b")
+TestNamedTupleInput_0 = namedtuple("NamedTuple", EXPECTED_FIELDS)
+
+class TestNamedTupleInput_1(NamedTuple):
+    a: torch.tensor
+    b: torch.tensor
 
 skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
 
@@ -3785,16 +3792,90 @@ class DistributedTest:
         @require_backends_available({"gloo", "nccl"})
         @skip_if_lt_x_gpu(2)
         @skip_if_rocm
-        def test_ddp_namedtuple(self):
-            expected_fields = ("a", "b")
-            TestNamedTupleInput_0 = namedtuple("NamedTuple", expected_fields)
+        def test_ddp_device(self):
+            m = nn.Linear(10, 10).to(self.rank)
+            expected_len = 2
+
+            class TensorWrapper:
+                __slots__ = ['t']
+
+                def __init__(self, t):
+                    self.t = t
+
+            # Handlers for specific types of validation we want to do based on
+            # the input type.
+
+            def tuple_and_list_validator(x):
+                self.assertTrue(len(x), expected_len)
+                self.assertEqual(1, len(set(t.device for t in x)))
+                self.assertEqual(x[0].device.index, self.rank)
+                return x[0] + x[1]
+
+            def namedtuple_validator(x):
+                self.assertEqual(x._fields, EXPECTED_FIELDS)
+                self.assertEqual(x.a.device.index, x.b.device.index)
+                self.assertEqual(x.a.device.index, self.rank)
+                return x.a + x.b
+
+            def custom_type_validator(x):
+                self.assertEqual(str(x.t.device), "cpu")
+                x.t = x.t.to(self.rank)
+                return x.t
+
+            validators = {
+                TensorWrapper: custom_type_validator,
+                tuple: tuple_and_list_validator,
+                list: tuple_and_list_validator,
+                TestNamedTupleInput_0: namedtuple_validator,
+                TestNamedTupleInput_1: namedtuple_validator,
+            }
+
+            class ToyModel(torch.nn.Module):
+                def __init__(_self):  # noqa: B902
+                    super().__init__()
+                    _self.lin = nn.Linear(10, 10, bias=False)
+
+                def forward(_self, x, expected_type):  # noqa: B902
+                    # Similar to scatter, the recursive to in the single-device
+                    # case does not move tensors if they are in a custom type.
+                    self.assertTrue(isinstance(x, expected_type))
+                    fwd_tensor = validators[expected_type](x)
+                    return _self.lin(fwd_tensor)
+
+            model = torch.nn.parallel.DistributedDataParallel(
+                ToyModel().to(self.rank), device_ids=[self.rank]
+            )
+            # CPU tuple input, should be moved to the proper device before call
+            # to forward.
+            inp = tuple(torch.randn(10, 10) for _ in range(expected_len))
+            model(inp, tuple)
+            # List CPU input, should be moved to proper device before call to
+            # forward.
+            inp = [torch.randn(10, 10) for _ in range(expected_len)]
+            model(inp, list)
+            # Custom type containing tensor. The type is maintained, but the
+            # device is not propagated (which is what happens with scatter too)
+            inp = TensorWrapper(torch.randn(10, 10))
+            model(inp, TensorWrapper)
 
             batch = 5
             dim = 10
+            a = torch.rand(batch, dim)
+            b = torch.rand(batch, dim)
 
-            class TestNamedTupleInput_1(NamedTuple):
-                a: torch.tensor
-                b: torch.tensor
+            inp = TestNamedTupleInput_0(a, b)
+            model(inp, type(inp))
+
+            inp = TestNamedTupleInput_1(a, b)
+            model(inp, type(inp))
+
+        @require_backend({"gloo", "nccl"})
+        @require_backends_available({"gloo", "nccl"})
+        @skip_if_lt_x_gpu(2)
+        @skip_if_rocm
+        def test_ddp_namedtuple(self):
+            batch = 5
+            dim = 10
 
             a = torch.rand(batch, dim, device=self.rank)
             b = torch.rand(batch, dim, device=self.rank)
@@ -3810,7 +3891,7 @@ class DistributedTest:
                         isinstance(input, expected_type),
                         f"Expected type {expected_type} but got {type(input)}",
                     )
-                    self.assertEqual(input._fields, expected_fields)
+                    self.assertEqual(input._fields, EXPECTED_FIELDS)
                     self.assertEqual(a, input.a)
                     self.assertEqual(b, input.b)
                     return _self.lin(torch.mul(input.a, input.b))
